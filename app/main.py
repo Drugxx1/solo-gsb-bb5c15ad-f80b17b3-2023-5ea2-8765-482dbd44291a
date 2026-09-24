@@ -24,20 +24,23 @@ from . import terms as terms_lib
 from .reading_load import find_reading_zones
 from .srt import SrtParseError, parse_document, parse_srt, rewrite_srt
 from .timecode import format_signed_timecode, format_timecode
+from .wrap import apply_wrap, line_display_width
 
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(
-    title="字幕校正、位置规划、专名统一与阅读负荷工具",
+    title="字幕校正、位置规划、专名统一、智能断行与阅读负荷工具",
     description="粘贴 SRT 后可做时间漂移校正、按画面遮挡时段规划字幕上下位置、"
-    "统一专名别名，或分析重叠字幕叠加后的阅读负荷热区。",
-    version="1.3.0",
+    "统一专名别名、按列数/行数智能断行，或分析重叠字幕叠加后的阅读负荷热区。",
+    version="1.4.0",
 )
 
 _FIELD_LABELS = {
     "rate_threshold": "阅读速率阈值（字/秒）",
     "min_duration_ms": "最短持续时长（毫秒）",
     "switch_cost_ms": "相邻字幕上下换位代价（毫秒）",
+    "max_columns": "每行最大显示列数",
+    "max_lines": "每条字幕最多行数",
 }
 
 
@@ -62,7 +65,11 @@ async def validation_exception_handler(
         elif err.get("type") == "greater_than":
             message = f"{label}必须严格大于 0。"
         elif err.get("type") == "greater_than_equal":
-            message = f"{label}不能小于 0。"
+            limit = err.get("ctx", {}).get("ge")
+            if isinstance(limit, int) and limit == 1:
+                message = f"{label}必须为不小于 1 的整数。"
+            else:
+                message = f"{label}不能小于 {limit if limit is not None else 0}。"
         else:
             message = f"{label}不合法。"
         return JSONResponse(
@@ -213,6 +220,54 @@ class TermsResponse(BaseModel):
     hit_count: int
 
 
+class WrapRequest(BaseModel):
+    srt: str = Field(..., description="原始 SRT 内容")
+    max_columns: StrictInt = Field(
+        ..., ge=1, le=1000, description="每行最大显示列数（正整数）"
+    )
+    max_lines: StrictInt = Field(
+        ..., ge=1, le=100, description="每条字幕最多行数（正整数）"
+    )
+
+
+class WrappedLineView(BaseModel):
+    text: str
+    columns: int
+
+
+class WrappedCueView(BaseModel):
+    cue_order: int
+    index: str
+    start: str
+    end: str
+    original_text: str
+    lines: list[WrappedLineView]
+    line_count: int
+    changed: bool
+
+
+class SkippedCueView(BaseModel):
+    cue_order: int
+    index: str
+    start: str
+    end: str
+    reason_code: str
+    reason: str
+    text: str
+
+
+class WrapResponse(BaseModel):
+    wrapped_srt: str
+    max_columns: int
+    max_lines: int
+    cue_count: int
+    wrapped_count: int
+    changed_count: int
+    skipped_count: int
+    cues: list[WrappedCueView]
+    skipped: list[SkippedCueView]
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -236,6 +291,11 @@ def reading_load_page() -> FileResponse:
 @app.get("/terms")
 def terms_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "terms.html")
+
+
+@app.get("/wrap")
+def wrap_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "wrap.html")
 
 
 @app.post("/api/correct", response_model=CorrectResponse)
@@ -444,4 +504,72 @@ def unify_terms(req: TermsRequest) -> TermsResponse | JSONResponse:
             for hit in hits
         ],
         hit_count=len(hits),
+    )
+
+
+@app.post("/api/wrap", response_model=WrapResponse)
+def wrap_subtitles(req: WrapRequest) -> WrapResponse | JSONResponse:
+    # 1. 复用现有 SRT 解析，并取每条字幕正文在物理行序列中的区间
+    try:
+        doc = parse_document(req.srt)
+    except SrtParseError as exc:
+        raise HTTPException(status_code=422, detail={"type": "srt", "message": str(exc)})
+
+    # 2. 逐条做 DP 最优断行；排不下的保留原正文并记录原因。只改写成功字幕
+    #    的正文，序号、时间轴、定位参数、空行、BOM 与原换行风格保持原样
+    wrapped_srt, results, skipped_results = apply_wrap(
+        req.srt,
+        [cue.index for cue in doc.cues],
+        [(r.start_line, r.end_line) for r in doc.body_ranges],
+        req.max_columns,
+        req.max_lines,
+    )
+
+    result_by_order = {r.cue_order: r for r in results}
+    skipped_by_order = {s.cue_order: s for s in skipped_results}
+
+    cue_views: list[WrappedCueView] = []
+    skipped_views: list[SkippedCueView] = []
+    for cue_order, cue in enumerate(doc.cues, start=1):
+        if cue_order in skipped_by_order:
+            skip = skipped_by_order[cue_order]
+            skipped_views.append(
+                SkippedCueView(
+                    cue_order=cue_order,
+                    index=cue.index,
+                    start=format_timecode(cue.start),
+                    end=format_timecode(cue.end),
+                    reason_code=skip.reason_code,
+                    reason=skip.reason,
+                    text=cue.text,
+                )
+            )
+            continue
+        result = result_by_order[cue_order]
+        cue_views.append(
+            WrappedCueView(
+                cue_order=cue_order,
+                index=cue.index,
+                start=format_timecode(cue.start),
+                end=format_timecode(cue.end),
+                original_text=result.original_text,
+                lines=[
+                    WrappedLineView(text=line, columns=line_display_width(line))
+                    for line in result.lines
+                ],
+                line_count=result.line_count,
+                changed=result.changed,
+            )
+        )
+
+    return WrapResponse(
+        wrapped_srt=wrapped_srt,
+        max_columns=req.max_columns,
+        max_lines=req.max_lines,
+        cue_count=len(doc.cues),
+        wrapped_count=len(results),
+        changed_count=sum(1 for r in results if r.changed),
+        skipped_count=len(skipped_results),
+        cues=cue_views,
+        skipped=skipped_views,
     )

@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>字幕智能断行</title>
+<style>
+  :root {
+    --bg: #f4f6fa;
+    --card: #ffffff;
+    --border: #d9dee8;
+    --text: #1f2733;
+    --muted: #6b7686;
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --danger: #dc2626;
+    --danger-bg: #fef2f2;
+    --warn-bg: #fffbeb;
+    --warn-border: #f59e0b;
+    --ok-bg: #f0fdf4;
+    --ok-border: #16a34a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 28px 20px 64px; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .nav { margin: 0 0 16px; font-size: 14px; }
+  .nav a { color: var(--primary); text-decoration: none; margin-right: 16px; }
+  .nav a:hover { text-decoration: underline; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  label { display: block; font-weight: 600; margin-bottom: 6px; }
+  .hint { color: var(--muted); font-weight: 400; font-size: 13px; }
+  textarea {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font: 13px/1.6 var(--mono);
+    resize: vertical;
+  }
+  #srt { min-height: 220px; }
+  textarea:focus, input:focus { outline: 2px solid rgba(37, 99, 235, .35); border-color: var(--primary); }
+  input[type="number"] {
+    width: 110px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font: 14px var(--mono);
+  }
+  .params { display: flex; gap: 28px; flex-wrap: wrap; }
+  .params .field { flex: 0 0 auto; }
+  button {
+    border: 1px solid var(--border);
+    background: #fff;
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:hover { background: #f1f4f9; }
+  button.primary {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #fff;
+    font-weight: 600;
+    padding: 10px 22px;
+  }
+  button.primary:hover { background: var(--primary-hover); }
+  .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+  .alert {
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    font-size: 14px;
+    white-space: pre-wrap;
+  }
+  .alert.error { background: var(--danger-bg); border: 1px solid var(--danger); color: var(--danger); }
+  .alert.warn { background: var(--warn-bg); border: 1px solid var(--warn-border); color: #92400e; }
+  .alert.ok { background: var(--ok-bg); border: 1px solid var(--ok-border); color: #166534; }
+  .hidden { display: none; }
+  .preview {
+    width: 100%;
+    min-height: 220px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font: 13px/1.6 var(--mono);
+    background: #fafbfc;
+    white-space: pre-wrap;
+    overflow-x: auto;
+  }
+  table.cues { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
+  table.cues th, table.cues td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+  table.cues th { background: #f8fafc; }
+  td.num { width: 56px; color: var(--muted); text-align: right; }
+  td.tc { font-family: var(--mono); white-space: nowrap; color: var(--muted); }
+  .bodylines { font-family: var(--mono); white-space: pre-wrap; }
+  .bodylines .vline { display: block; }
+  .colwidth { color: var(--muted); font-size: 12px; margin-left: 8px; }
+  .colwidth.over { color: var(--danger); font-weight: 700; }
+  tr.skipped { background: var(--danger-bg); }
+  tr.unchanged td { color: var(--muted); }
+  .reason { color: var(--danger); }
+  .badge {
+    display: inline-block; border-radius: 999px; padding: 1px 10px;
+    font-size: 12px; font-weight: 600; margin-left: 8px;
+  }
+  .badge.changed { background: #dbeafe; color: #1e40af; }
+  .badge.same { background: #e5e7eb; color: #4b5563; }
+  .badge.skip { background: #fee2e2; color: #991b1b; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="nav">
+    <a href="/">字幕时间漂移校正</a>
+    <a href="/placement">字幕位置规划</a>
+    <a href="/reading-load">阅读负荷热区</a>
+    <a href="/terms">字幕专名统一</a>
+  </p>
+  <h1>字幕智能断行</h1>
+  <p class="sub">粘贴 SRT，填写每行最大显示列数与每条字幕最多行数。系统先把每条正文的原有换行与连续空白折成单个空格，
+    以空格和汉字 / 中文标点相邻处为可断位置（英文单词不拆开），按东亚宽 / 全角字符 2 列、组合字符 0 列、其他可见字符 1 列计宽，
+    遵守“闭标点不行首、开标点不行尾”，用动态规划在限制内最小化各行剩余列数的平方和；排不下的字幕保留原正文并说明原因。</p>
+
+  <div class="card">
+    <label for="srt">原始 SRT 字幕</label>
+    <textarea id="srt" placeholder="1&#10;00:00:01,000 --> 00:00:04,000&#10;你好世界，这是一条用来测试智能断行效果的字幕&#10;&#10;2&#10;00:00:05,000 --> 00:00:08,000&#10;hello world this is a very long English sentence"></textarea>
+  </div>
+
+  <div class="card">
+    <h2>断行参数</h2>
+    <div class="params">
+      <div class="field">
+        <label for="maxColumns">每行最大显示列数 <span class="hint">宽 / 全角字符占 2 列</span></label>
+        <input type="number" id="maxColumns" min="1" max="1000" step="1" value="20">
+      </div>
+      <div class="field">
+        <label for="maxLines">每条字幕最多行数</label>
+        <input type="number" id="maxLines" min="1" max="100" step="1" value="2">
+      </div>
+    </div>
+    <div class="toolbar">
+      <button type="button" class="primary" id="submit">智能断行</button>
+      <button type="button" id="fillExample">填入示例</button>
+      <span class="hint" id="status"></span>
+    </div>
+  </div>
+
+  <div id="errorBox" class="alert error hidden"></div>
+
+  <div id="resultCard" class="card hidden">
+    <h2>断行结果</h2>
+    <div id="summaryBox" class="alert ok hidden"></div>
+    <div id="skipBox" class="alert warn hidden"></div>
+    <div class="toolbar" style="margin-top:0;">
+      <button type="button" class="primary" id="download">下载 wrapped.srt</button>
+      <span class="hint">下载内容与下方预览是接口返回的同一份 SRT：只改成功字幕的正文，序号、时间轴、定位参数、BOM 与原换行风格保持原样。</span>
+    </div>
+    <table class="cues">
+      <thead>
+        <tr>
+          <th style="width:56px;">序号</th>
+          <th style="width:170px;">时间轴</th>
+          <th>断行后正文（右侧为各行列宽）</th>
+        </tr>
+      </thead>
+      <tbody id="cueTable"></tbody>
+    </table>
+    <h2 style="margin-top:18px;">结果 SRT 预览</h2>
+    <pre class="preview" id="preview"></pre>
+  </div>
+</div>
+
+<script>
+(function () {
+  const srtEl = document.getElementById("srt");
+  const maxColumnsEl = document.getElementById("maxColumns");
+  const maxLinesEl = document.getElementById("maxLines");
+  const errorBox = document.getElementById("errorBox");
+  const resultCard = document.getElementById("resultCard");
+  const previewEl = document.getElementById("preview");
+  const cueTableEl = document.getElementById("cueTable");
+  const summaryBox = document.getElementById("summaryBox");
+  const skipBox = document.getElementById("skipBox");
+  const statusEl = document.getElementById("status");
+
+  function showError(message) {
+    errorBox.textContent = message;
+    errorBox.classList.remove("hidden");
+  }
+  function clearAlerts() {
+    errorBox.classList.add("hidden");
+    summaryBox.classList.add("hidden");
+    skipBox.classList.add("hidden");
+    errorBox.textContent = "";
+    summaryBox.textContent = "";
+    skipBox.textContent = "";
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+  }
+
+  const EXAMPLE_SRT =
+    "1\r\n00:00:01,000 --> 00:00:04,000\r\n你好世界，这是一条用来测试智能断行效果的中文字幕\r\n\r\n" +
+    "2\r\n00:00:05,000 --> 00:00:08,000\r\nhello world, this is a very long English sentence indeed\r\n\r\n" +
+    "3\r\n00:00:09,000 --> 00:00:11,000\r\n短句不用动\r\n\r\n" +
+    "4\r\n00:00:12,000 --> 00:00:14,000\r\n（全角标点与宽字符）ＡＢＣＤＥＦＧＨＩＪＫＬＭＮ\r\n";
+
+  document.getElementById("fillExample").addEventListener("click", () => {
+    srtEl.value = EXAMPLE_SRT;
+    clearAlerts();
+    resultCard.classList.add("hidden");
+  });
+
+  function reasonText(code) {
+    return code === "atom_too_wide"
+      ? "存在超过单列宽度的不可拆片段（如过长英文单词）"
+      : "满足列宽与避头尾所需的行数超过最多行数";
+  }
+
+  document.getElementById("submit").addEventListener("click", async () => {
+    clearAlerts();
+    resultCard.classList.add("hidden");
+    statusEl.textContent = "断行中…";
+
+    try {
+      const resp = await fetch("/api/wrap", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          srt: srtEl.value,
+          max_columns: parseInt(maxColumnsEl.value, 10),
+          max_lines: parseInt(maxLinesEl.value, 10)
+        })
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showError((data.detail && data.detail.message) || ("请求失败（HTTP " + resp.status + "）"));
+        statusEl.textContent = "";
+        return;
+      }
+
+      // 页面预览与下载共用同一份服务器返回的 wrapped_srt（保留原 BOM / 换行风格）
+      window.__wrappedSrt = data.wrapped_srt;
+      previewEl.textContent = window.__wrappedSrt;
+
+      const rows = [];
+      for (const cue of data.cues) {
+        const linesHtml = cue.lines.map(l => {
+          const over = l.columns > data.max_columns ? " over" : "";
+          return '<span class="vline">' + escapeHtml(l.text) +
+            '<span class="colwidth' + over + '">[' + l.columns + " 列]</span></span>";
+        }).join("");
+        const badge = cue.changed
+          ? '<span class="badge changed">已重排</span>'
+          : '<span class="badge same">原样保留</span>';
+        rows.push(
+          '<tr class="' + (cue.changed ? "changed" : "unchanged") + '">' +
+          '<td class="num">' + escapeHtml(cue.index) + badge + "</td>" +
+          '<td class="tc">' + cue.start + "<br>" + cue.end + "</td>" +
+          '<td class="bodylines">' + linesHtml + "</td>" +
+          "</tr>"
+        );
+      }
+      for (const skip of data.skipped) {
+        rows.push(
+          '<tr class="skipped">' +
+          '<td class="num">' + escapeHtml(skip.index) + '<span class="badge skip">排不下</span></td>' +
+          '<td class="tc">' + skip.start + "<br>" + skip.end + "</td>" +
+          '<td class="bodylines"><span class="vline">' + escapeHtml(skip.text.replace(/\n/g, "⏎\n")) +
+          "</span><span class=\"reason\">第 " + skip.cue_order + " 条（输入顺序号）排不下：" +
+          escapeHtml(skip.reason) + "</span></td>" +
+          "</tr>"
+        );
+      }
+      cueTableEl.innerHTML = rows.join("");
+
+      summaryBox.textContent =
+        "共 " + data.cue_count + " 条字幕：成功断行 " + data.wrapped_count +
+        " 条（其中正文有改动 " + data.changed_count + " 条），排不下保留原文 " +
+        data.skipped_count + " 条。每行上限 " + data.max_columns + " 列，每条最多 " +
+        data.max_lines + " 行。";
+      summaryBox.classList.remove("hidden");
+      if (data.skipped_count > 0) {
+        skipBox.textContent = "有 " + data.skipped_count +
+          " 条字幕排不下，已按原正文保留；详见下表红色行给出的输入顺序号与原因。";
+        skipBox.classList.remove("hidden");
+      }
+      resultCard.classList.remove("hidden");
+      statusEl.textContent = "";
+    } catch (err) {
+      showError("请求出错：" + err);
+      statusEl.textContent = "";
+    }
+  });
+
+  document.getElementById("download").addEventListener("click", () => {
+    // 预览与下载使用同一份服务器返回：只改成功字幕正文，
+    // 原文件的 BOM / CRLF / LF 均保留，这里不再额外处理，避免重复 BOM。
+    const content = window.__wrappedSrt || "";
+    const blob = new Blob([content], { type: "application/x-subrip;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "wrapped.srt";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+})();
+</script>
+</body>
+</html>

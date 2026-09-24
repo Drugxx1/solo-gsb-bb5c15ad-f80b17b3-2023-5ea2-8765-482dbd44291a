@@ -1037,3 +1037,309 @@ def test_api_terms_longer_alias_in_later_rule_wins():
         (7, "AB", "短"),
     ]
 
+
+
+# ---------- 字幕智能断行 ----------
+
+import unicodedata  # noqa: E402
+
+from app.wrap import (  # noqa: E402
+    AtomTooWideError,
+    TooManyLinesError,
+    apply_wrap,
+    build_units,
+    display_width,
+    line_display_width,
+    normalize_body,
+    wrap_cue,
+)
+
+WRAP_SRT = (
+    "1\r\n"
+    "00:00:01,000 --> 00:00:03,000 X1:10\r\n"
+    "你好世界这是测试\r\n"
+    "\r\n"
+    "2\n"
+    "00:00:04,000 --> 00:00:06,000\n"
+    "internationalization is long\n"
+    "\n"
+    "3\r"
+    "00:00:07,000 --> 00:00:09,000\r"
+    "短\r"
+)
+
+
+def test_normalize_collapses_all_whitespace_and_strips():
+    assert normalize_body(" 你好\t世界\n\n这是　测试 \n") == "你好 世界 这是 测试"
+    assert normalize_body("a  \t b") == "a b"
+
+
+def test_display_width_wide_fullwidth_and_combining():
+    assert display_width("你") == 2
+    assert display_width("，") == 2
+    assert display_width("Ａ") == 2          # 全角拉丁字母
+    assert display_width("a") == 1
+    assert display_width(" ") == 1
+    # 组合重音记号（U+0301）计 0 列
+    assert display_width("́") == 0
+    # 预组合字符仍是普通可见字符，计 1 列
+    assert display_width("é") == 1
+    # 组合记号附着在基字符后的整行宽度
+    assert line_display_width("café") == 4
+
+
+def test_build_units_keeps_english_words_atomic():
+    units = build_units("hello world 你好")
+    assert [u.ch for u in units] == ["hello", "world", "你", "好"]
+    assert [u.space_before for u in units] == [False, True, True, False]
+    assert units[0].width == 5
+
+
+def test_wrap_basic_chinese_balances_lines():
+    lines = wrap_cue("你好世界这是测试", 10, 2)
+    assert lines == ["你好世界", "这是测试"]
+    assert [line_display_width(x) for x in lines] == [8, 8]
+
+
+def test_wrap_whitespace_becomes_space_breaks():
+    # 归一化后两字 + 空格 + 两字宽 9 列：9 列下可整行，行内空格计 1 列
+    lines = wrap_cue("你好\t世界", 9, 2)
+    assert lines == ["你好 世界"]
+    assert line_display_width(lines[0]) == 9
+    # 8 列下汉字相邻断法（空格保留到下一行首，行首空格计 1 列）代价更优
+    assert wrap_cue("你好\t世界", 8, 2) == ["你好", " 世界"]
+    # 压到 4 列：保留空格会让“ 世界”宽 5 超界，只能在空格处折（空格丢弃）
+    assert wrap_cue("你好\t世界", 4, 2) == ["你好", "世界"]
+    assert wrap_cue("这是\n\n测试", 4, 2) == ["这是", "测试"]
+    # 英文单词之间在空格处折行，折行处空格丢弃、不保留行尾空格
+    lines = wrap_cue("hello world", 7, 2)
+    assert lines == ["hello", "world"]
+    assert line_display_width(lines[0]) == 5
+    # 连续空白与原换行一律先折成单个空格
+    assert normalize_body("你好\n\n世界") == "你好 世界"
+
+
+def test_wrap_english_words_are_not_split():
+    # 长单词超宽：原子超宽，原文保留
+    with pytest.raises(AtomTooWideError):
+        wrap_cue("internationalization", 10, 2)
+    # 单词内部不断：即便列数够“拆词”，也只允许在空格处断
+    assert wrap_cue("abcdef gh", 6, 2) == ["abcdef", "gh"]
+
+
+def test_wrap_cjk_adjacency_break_positions():
+    # 汉字与英文相邻处可断，英文单词不拆
+    assert wrap_cue("你好 world 再见", 8, 3) == ["你好", "world", "再见"]
+    # 全角字符 2 列
+    assert wrap_cue("ＡＢＣ你好", 6, 2) == ["ＡＢ", "Ｃ你好"]
+
+
+def test_wrap_kinsoku_closing_not_at_line_start():
+    # 宽 8 上限下“（世界）”不能让“）”落行首：需 3 行
+    lines = wrap_cue("你好（世界）", 8, 3)
+    assert all(not line.startswith("）") for line in lines)
+    assert lines == ["你好", "（世界）"]
+    # 只允许 1 行且整条 12 列 -> 行数超限
+    with pytest.raises(TooManyLinesError):
+        wrap_cue("你好（世界）", 8, 1)
+
+
+def test_wrap_kinsoku_opening_not_at_line_end():
+    # “（”不能落在行尾：8 列上限下“你好世界”恰为 8 列，但从“界（”处
+    # 折行会让“（”留在行尾，断点必须前移到“好|世界（上）”或后移
+    lines = wrap_cue("你好世界（上）", 8, 2)
+    assert all(not line.endswith("（") for line in lines)
+    assert lines == ["你好世", "界（上）"]
+    # 开标点在整条开头 / 结尾时不产生断点，单行方案不受影响
+    assert wrap_cue("（标题）", 20, 1) == ["（标题）"]
+
+
+def test_wrap_too_many_lines_error():
+    with pytest.raises(TooManyLinesError):
+        wrap_cue("你好世界这是测试", 4, 1)
+    # 8 个汉字、每行 4 列、最多 1 行 -> 失败；放到 2 行成功
+    assert wrap_cue("你好世界这是测试", 8, 2) == ["你好世界", "这是测试"]
+
+
+def test_wrap_tie_prefers_earlier_break_sequence():
+    # “一二三四”宽 8：上限 6 列、2 行
+    #   断点 (2,)：行宽 4/4，剩余 2/2，代价 8
+    #   断点 (3,)：行宽 6/2，剩余 0/4，代价 16
+    # 断点靠前且代价更优 -> (2,)
+    assert wrap_cue("一二三四", 6, 2) == ["一二", "三四"]
+    # 构造同分：宽 2 的汉字，上限 4，4 字恰好每行 4 列，(2,) 唯一 2 行方案
+    assert wrap_cue("一二三四", 4, 2) == ["一二", "三四"]
+
+
+def test_wrap_never_exceeds_limits():
+    # 与暴力枚举一致性已在开发阶段校验；这里做随机性质回归
+    import random
+
+    rng = random.Random(42)
+    pool = "你好世界的是不了人一abcdef ，。！（）【】"
+    for _ in range(120):
+        text = "".join(rng.choice(pool) for _ in range(rng.randint(1, 12)))
+        mc, ml = rng.randint(2, 10), rng.randint(1, 3)
+        try:
+            lines = wrap_cue(text, mc, ml)
+        except (AtomTooWideError, TooManyLinesError):
+            continue
+        from app.wrap import _CLOSING_PUNCT, _OPENING_PUNCT
+
+        assert len(lines) <= ml
+        assert all(line_display_width(line) <= mc for line in lines)
+        # 避头尾约束作用于断点：除整段开头 / 结尾外，行首不得是闭标点、
+        # 行尾不得是开标点
+        if len(lines) > 1:
+            assert all(line[0] not in _CLOSING_PUNCT for line in lines[1:])
+            assert all(line[-1] not in _OPENING_PUNCT for line in lines[:-1])
+
+
+def test_apply_wrap_preserves_index_timing_params_bom_eol():
+    doc = parse_document(WRAP_SRT)
+    out, results, skipped = apply_wrap(
+        WRAP_SRT,
+        [c.index for c in doc.cues],
+        [(r.start_line, r.end_line) for r in doc.body_ranges],
+        10,
+        2,
+    )
+    # 第 1 条重排成功：CRLF 与定位参数保留
+    assert out.startswith(
+        "1\r\n00:00:01,000 --> 00:00:03,000 X1:10\r\n你好世界\r\n这是测试\r\n"
+    )
+    # 第 2 条排不下：原 LF 正文逐字符保留
+    assert "2\n00:00:04,000 --> 00:00:06,000\ninternationalization is long\n" in out
+    # 第 3 条已是单行短正文：CR 行尾保留
+    assert out.endswith("3\r00:00:07,000 --> 00:00:09,000\r短\r")
+
+    assert [(r.cue_order, r.changed) for r in results] == [(1, True), (3, False)]
+    assert len(skipped) == 1
+    assert skipped[0].cue_order == 2
+    assert skipped[0].index == "2"
+    assert skipped[0].reason_code == "atom_too_wide"
+
+
+def test_apply_wrap_all_skipped_is_byte_identical():
+    src = BOM + BOM + "1\n00:00:01,000 --> 00:02:00,000\ninternationalization\n"
+    doc = parse_document(src)
+    out, results, skipped = apply_wrap(
+        src,
+        [c.index for c in doc.cues],
+        [(r.start_line, r.end_line) for r in doc.body_ranges],
+        5,
+        2,
+    )
+    assert out == src  # 全部排不下：连重复 BOM 都逐字符保留
+    assert results == [] and len(skipped) == 1
+
+
+def test_apply_wrap_unchanged_cue_is_byte_identical():
+    src = "1\n00:00:01,000 --> 00:02:00,000\n短\n"
+    doc = parse_document(src)
+    out, _, skipped = apply_wrap(
+        src,
+        [c.index for c in doc.cues],
+        [(r.start_line, r.end_line) for r in doc.body_ranges],
+        10,
+        2,
+    )
+    assert out == src and skipped == []
+
+
+def test_wrap_page_served():
+    resp = client.get("/wrap")
+    assert resp.status_code == 200
+    assert "字幕智能断行" in resp.text
+    assert "/api/wrap" in resp.text
+
+
+def wrap_body(**overrides):
+    body = {"srt": WRAP_SRT, "max_columns": 10, "max_lines": 2}
+    body.update(overrides)
+    return body
+
+
+def test_api_wrap_success_and_lossless_format():
+    resp = client.post("/api/wrap", json=wrap_body())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["cue_count"] == 3
+    assert data["wrapped_count"] == 2
+    assert data["changed_count"] == 1
+    assert data["skipped_count"] == 1
+    assert data["cues"][0]["lines"] == [
+        {"text": "你好世界", "columns": 8},
+        {"text": "这是测试", "columns": 8},
+    ]
+    # 第 3 条短正文 changed=False
+    assert data["cues"][1]["changed"] is False
+    # 跳过项带回输入顺序号与原因
+    skip = data["skipped"][0]
+    assert skip["cue_order"] == 2 and skip["index"] == "2"
+    assert skip["reason_code"] == "atom_too_wide"
+    assert "internationalization" in skip["reason"]
+    # 同一份 SRT：BOM 无关（本例无 BOM），CRLF/LF/CR 混排与定位参数保留
+    srt_out = data["wrapped_srt"]
+    assert srt_out.startswith(
+        "1\r\n00:00:01,000 --> 00:00:03,000 X1:10\r\n你好世界\r\n这是测试\r\n"
+    )
+    assert srt_out.endswith("3\r00:00:07,000 --> 00:00:09,000\r短\r")
+    # 第 1 条由 1 行正文变 2 行：新增一个物理行，沿用 CRLF，故 CRLF 多 1；
+    # 其余行（LF / CR 混排、定位参数）不变
+    assert srt_out.count("\r\n") == WRAP_SRT.count("\r\n") + 1
+    assert srt_out.count("\r") == WRAP_SRT.count("\r") + 1
+
+
+def test_api_wrap_too_many_lines_reports_skipped():
+    src = "1\n00:00:01,000 --> 00:00:03,000\n你好世界这是测试\n"
+    resp = client.post("/api/wrap", json={"srt": src, "max_columns": 4, "max_lines": 1})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["wrapped_count"] == 0 and data["skipped_count"] == 1
+    assert data["skipped"][0]["reason_code"] == "too_many_lines"
+    assert data["wrapped_srt"] == src  # 排不下保留原正文
+
+
+def test_api_wrap_preserves_bom():
+    src = (
+        BOM
+        + "1\r\n00:00:01,000 --> 00:00:03,000\r\n你好世界这是测试\r\n\r\n"
+        + "2\n00:00:04,000 --> 00:00:06,000\n短\n"
+    )
+    resp = client.post("/api/wrap", json={"srt": src, "max_columns": 8, "max_lines": 2})
+    assert resp.status_code == 200, resp.text
+    out = resp.json()["wrapped_srt"]
+    assert out.startswith(BOM + "1\r\n")
+    assert "你好世界\r\n这是测试\r\n" in out
+
+
+@pytest.mark.parametrize("bad_columns", [0, -1, 1.5, True, False, "20", None])
+def test_api_wrap_rejects_bad_max_columns(bad_columns):
+    resp = client.post("/api/wrap", json=wrap_body(max_columns=bad_columns))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["field"] == "max_columns"
+
+
+@pytest.mark.parametrize("bad_lines", [0, -1, 2.0, "2", None])
+def test_api_wrap_rejects_bad_max_lines(bad_lines):
+    resp = client.post("/api/wrap", json=wrap_body(max_lines=bad_lines))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["field"] == "max_lines"
+
+
+def test_api_wrap_rejects_bad_srt():
+    resp = client.post("/api/wrap", json=wrap_body(srt="garbage"))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "srt"
+
+
+def test_api_wrap_combining_character_counts_zero_columns():
+    # e + U+0301 组合重音：café 共 4 列（组合记号 0 列）
+    src = "1\n00:00:01,000 --> 00:03:00,000\ncafé 你好\n"
+    resp = client.post("/api/wrap", json={"srt": src, "max_columns": 5, "max_lines": 2})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    cue = data["cues"][0]
+    assert cue["lines"][0]["text"] == "café"
+    assert cue["lines"][0]["columns"] == 4

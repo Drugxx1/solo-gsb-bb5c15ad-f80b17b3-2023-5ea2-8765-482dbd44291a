@@ -1,6 +1,6 @@
-# 字幕校正、位置规划、专名统一与阅读负荷工具
+# 字幕校正、位置规划、专名统一、智能断行与阅读负荷工具
 
-基于 **Python + FastAPI** 的轻量 Web 工具，包含四个功能页面：
+基于 **Python + FastAPI** 的轻量 Web 工具，包含五个功能页面：
 
 1. **字幕时间漂移校正**：粘贴 SRT 字幕，填入多组人工确认的「原时间 / 正确时间」
    锚点，按分段线性映射校正字幕时间，在网页预览并下载校正后的 SRT。
@@ -13,6 +13,10 @@
 4. **字幕专名统一**（<http://localhost:8000/terms>）：粘贴 SRT，按行输入专名的
    标准写法与别名，只扫描字幕正文各物理行，按最长别名优先、等长按输入顺序的规则
    从左到右一次替换，页面显示逐处替换清单并下载仅改正文命中片段的修订 SRT。
+5. **字幕智能断行**（<http://localhost:8000/wrap>）：粘贴 SRT，输入每行最大显示
+   列数与每条字幕最多行数；按宽 / 全角字符 2 列、组合字符 0 列计宽，以空格和
+   汉字 / 中文标点相邻处为可断位置（英文单词不拆开），遵守避头尾规则，用动态
+   规划在限制内最小化各行剩余列数的平方和，页面预览并下载同一份重排 SRT。
 
 ## 功能与校正规则（时间漂移）
 
@@ -103,6 +107,43 @@
   `revised_srt`（UTF-8，原 BOM / 换行风格保留）。规则非法或 SRT 无法
   解析时，接口返回 `422`。
 
+## 功能与断行规则（字幕智能断行）
+
+- 输入 SRT（复用同一套字幕解析器）、**每行最大显示列数** `max_columns`
+  （1–1000 的正整数）与**每条字幕最多行数** `max_lines`（1–100 的正整数），
+  逐条字幕独立规划。
+- **空白归一化**：每条正文里的原有换行（CRLF/LF/CR）及连续 Unicode 空白
+  （制表符、全角空格 `　` 等）统一折成**单个半角空格**，并去掉正文首尾空白。
+- **可断位置**：空格处（在空格处折行时该空格丢弃）以及**汉字 / 中文标点与
+  任意字符的相邻处**；若空格两侧都是汉字 / 中文标点，则两种断法（空格丢弃，
+  或空格保留到下一行行首并占 1 列）都视为候选，由动态规划按代价选择。
+  连续的非汉字非空白字符（英文单词、数字、URL 等）作为整体，**不拆开**。
+- **显示列宽**：东亚宽字符 / 全角字符（Unicode East Asian Width 为 `W` /
+  `F`，含汉字、中文标点、全角拉丁字母）计 **2 列**；组合字符（Unicode
+  通用类别 `Mn` / `Me`，如重音组合记号）计 **0 列**；其他可见字符计 **1 列**。
+- **避头尾**：闭标点（`）》】」』，。！？；：、…—` 等）不允许出现在行首，
+  开标点（`（《【「『“‘` 等）不允许出现在行尾；整条字幕开头 / 结尾处的
+  标点不产生断点，不受此限。
+- **动态规划目标**：在每行不超过 `max_columns` 列、总行数不超过
+  `max_lines` 的可行方案中，最小化**各行剩余列数（列数上限 − 该行实际列宽）
+  的平方和**；代价完全相同时按**断点序列字典序靠前**（断点尽量靠前，
+  同位置优先保留空格的汉字相邻断法）。
+- **排不下的字幕保留原正文不动**，并在响应 `skipped` 中给出该条的
+  **输入顺序号** `cue_order`（按粘贴 SRT 中出现位置从 1 开始，与字幕自身
+  序号无关）、SRT 序号 `index`、时间轴、原因码与中文原因：
+  - `atom_too_wide`：存在宽度超过单列上限的不可拆片段（如过长英文单词）；
+  - `too_many_lines`：满足列宽与避头尾约束所需的最少行数仍超过 `max_lines`。
+- **无损导出**：直接在原始 SRT 物理行上只替换**成功断行且正文确有变化**的
+  字幕正文；字幕序号、时间轴、`X1:`/`X2:`/`Y1:`/`Y2:`/`Position:` 等定位
+  参数、块间空行、原有换行（CRLF/LF/CR 原样保留，新折出的物理行沿用该条
+  原正文的行尾风格）以及文件开头的 UTF-8 BOM 均保持不变；**没有任何成功
+  重排（全部排不下或正文均无需改动）时，结果 SRT 与输入逐字符一致**。
+- 页面以逐条卡片预览断行结果（行尾标注各行列宽，排不下的字幕红色高亮并
+  显示输入顺序号与原因），并一键下载 `wrapped.srt`：**页面预览与下载使用
+  接口返回的同一份 `wrapped_srt`**（UTF-8，原 BOM / 换行风格保留）。
+  参数非法或 SRT 无法解析时接口返回 `422`（`detail.field` / `detail.type`
+  指出字段或 `srt`，`detail.message` 给出中文原因）。
+
 ## 一条命令启动（Docker Compose）
 
 ```bash
@@ -115,10 +156,12 @@ docker compose up -d --build
 - 字幕位置规划界面：<http://localhost:8000/placement>
 - 阅读负荷热区界面：<http://localhost:8000/reading-load>
 - 字幕专名统一界面：<http://localhost:8000/terms>
+- 字幕智能断行界面：<http://localhost:8000/wrap>
 - 时间漂移接口：`POST` <http://localhost:8000/api/correct>
 - 位置规划接口：`POST` <http://localhost:8000/api/placement>
 - 阅读负荷接口：`POST` <http://localhost:8000/api/reading-load>
 - 专名统一接口：`POST` <http://localhost:8000/api/terms>
+- 智能断行接口：`POST` <http://localhost:8000/api/wrap>
 - 健康检查：<http://localhost:8000/health>
 - 接口文档（FastAPI 自带）：<http://localhost:8000/docs>
 
@@ -138,7 +181,8 @@ docker compose up -d --build
 ```bash
 HOST_PORT=9000 docker compose up -d --build
 # 访问 http://localhost:9000/ 、http://localhost:9000/placement 、
-# http://localhost:9000/reading-load 与 http://localhost:9000/terms
+# http://localhost:9000/reading-load 、http://localhost:9000/terms 与
+# http://localhost:9000/wrap
 ```
 
 ## 不用 Docker，直接运行（Python 3.10+）
@@ -149,7 +193,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 同样访问 <http://localhost:8000/>、<http://localhost:8000/placement>、
-<http://localhost:8000/reading-load> 与 <http://localhost:8000/terms>。
+<http://localhost:8000/reading-load>、<http://localhost:8000/terms> 与
+<http://localhost:8000/wrap>。
 
 ## HTTP 接口
 
@@ -249,23 +294,54 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 指向不同标准写法时返回 `422`（`detail.type` 为 `terms`）；SRT 无法解析时
 `detail.type` 为 `srt`。
 
+### `POST /api/wrap`
+
+```json
+{
+  "srt": "1\r\n00:00:01,000 --> 00:00:04,000\r\n你好世界这是一条测试字幕\r\n\r\n2\n00:00:05,000 --> 00:00:08,000\ninternationalization is too long\n",
+  "max_columns": 12,
+  "max_lines": 2
+}
+```
+
+`max_columns` 为每行最大显示列数（1–1000 正整数，宽 / 全角字符 2 列、
+组合字符 0 列、其余可见字符 1 列），`max_lines` 为每条字幕最多行数
+（1–100 正整数）。成功返回：
+
+- `wrapped_srt`：与输入同构的完整 SRT 文本，**只替换成功断行且正文有变化**
+  的字幕正文，序号、时间轴、行尾排版参数、空行、CRLF/LF/CR 换行及开头
+  BOM 原样保留；没有任何成功重排时与输入**逐字符一致**；
+- `cues`：成功断行字幕列表，每项含 `cue_order`（输入顺序号，从 1 开始）、
+  `index`、起止时间、`original_text`、`lines`（每行 `text` 与实际
+  `columns` 列宽）、`line_count` 与 `changed`；
+- `skipped`：排不下、正文原样保留的字幕列表，每项含 `cue_order` /
+  `index` / 起止时间 / 原文 `text` / `reason_code`
+  （`atom_too_wide` 或 `too_many_lines`）与中文 `reason`；
+- 统计回显：`cue_count` / `wrapped_count` / `changed_count` /
+  `skipped_count` 及两个输入参数。
+
+参数不是合法正整数（含 `0`、负数、小数、布尔值、字符串）时返回 `422`
+（`detail.field` 指出字段）；SRT 无法解析时 `detail.type` 为 `srt`。
+
 ## 目录结构
 
 ```
 .
 ├── app/
-│   ├── main.py           # FastAPI 应用、/api/correct、/api/placement、/api/reading-load 与 /api/terms 接口
+│   ├── main.py           # FastAPI 应用、/api/correct、/api/placement、/api/reading-load、/api/terms 与 /api/wrap 接口
 │   ├── mapping.py        # 锚点校验与分段线性映射
 │   ├── placement.py      # 遮挡时段并集、遮挡时长统计、位置规划 DP、WebVTT 导出
 │   ├── reading_load.py   # 字 / 秒速率、半开时间轴事件扫描、热区合并与最短时长过滤
 │   ├── terms.py          # 专名规则校验、最长优先一次扫描与正文无损替换
+│   ├── wrap.py           # 空白归一化、列宽计算、避头尾断行动态规划与正文无损重写
 │   ├── srt.py            # SRT 解析、正文行定位与无损重写（保留原格式）
 │   ├── timecode.py       # 时间码解析与格式化（SRT / WebVTT）
 │   └── static/
 │       ├── index.html         # 时间漂移校正页面（原生 HTML/CSS/JS）
 │       ├── placement.html     # 字幕位置规划页面（原生 HTML/CSS/JS）
 │       ├── reading_load.html  # 阅读负荷热区页面（原生 HTML/CSS/JS）
-│       └── terms.html         # 字幕专名统一页面（原生 HTML/CSS/JS）
+│       ├── terms.html         # 字幕专名统一页面（原生 HTML/CSS/JS）
+│       └── wrap.html          # 字幕智能断行页面（原生 HTML/CSS/JS）
 ├── tests/               # 核心算法与接口测试
 ├── Dockerfile
 ├── docker-compose.yml
