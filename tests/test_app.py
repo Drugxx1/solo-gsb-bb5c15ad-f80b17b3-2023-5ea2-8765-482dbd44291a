@@ -5,6 +5,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.linewrap import (
+    WrapFailure,
+    WrapPlan,
+    build_atoms,
+    char_display_width,
+    is_cjk_char,
+    is_han,
+    normalize_text,
+    plan_wrap,
+    wrap_document,
+)
 from app.mapping import AnchorError, PiecewiseMapping, build_anchors
 from app.placement import (
     Block,
@@ -1037,3 +1048,304 @@ def test_api_terms_longer_alias_in_later_rule_wins():
         (7, "AB", "短"),
     ]
 
+
+
+# ---------- 字幕智能断行 ----------
+
+def test_char_width_east_asian_combining_and_other():
+    assert char_display_width("中") == 2          # W
+    assert char_display_width("，") == 2          # F（全角）
+    assert char_display_width("Ａ") == 2          # 全角字母 F
+    assert char_display_width("A") == 1
+    assert char_display_width("1") == 1
+    assert char_display_width("é") == 1           # 预组合字符本身占 1 列
+    assert char_display_width("́") == 0            # U+0301 组合附加符
+    assert char_display_width(" ") == 1
+
+
+def test_han_and_cjk_punct_classification():
+    assert is_han("中")
+    assert is_han("㐀") and is_han("𠀀")         # 扩展 A / 扩展 B
+    assert not is_han("A") and not is_han("，")
+    assert is_cjk_char("，") and is_cjk_char("。")
+    assert is_cjk_char("（") and is_cjk_char("《")
+    assert is_cjk_char("·") and is_cjk_char("—") and is_cjk_char("’")
+    assert not is_cjk_char(",") and not is_cjk_char("A")
+
+
+def test_normalize_collapses_all_whitespace():
+    assert normalize_text("一 二\n三\t四　五") == "一 二 三 四 五"
+    assert normalize_text("\r\n  你好　世界 \t ") == "你好 世界"
+
+
+def test_build_atoms_merges_english_but_splits_cjk():
+    atoms, gaps = build_atoms("hello world你好")
+    assert [a.text for a in atoms] == ["hello", "world", "你", "好"]
+    assert gaps == [True, False, False]  # hello/world 之间有空格，其余相邻
+    assert [a.width for a in atoms] == [5, 5, 2, 2]
+    assert [a.cjk for a in atoms] == [False, False, True, True]
+    # 英文单词内部的标点并入单词，不单独成原子
+    atoms2, _ = build_atoms("iPhone15, plus")
+    assert [a.text for a in atoms2] == ["iPhone15,", "plus"]
+    # 组合附加符并入前一原子，不产生额外原子
+    atoms3, _ = build_atoms("café 你好")
+    assert [a.text for a in atoms3] == ["café", "你", "好"]
+    assert atoms3[0].width == 4  # 4 个基字符，组合符 0 列
+
+
+def test_wrap_balances_lines_by_squared_slack():
+    # 6 个汉字共 12 列、8 列 2 行：均衡 3/3（代价 4+4）优于贪心 4/2（0+16）
+    plan = plan_wrap("一二三四五六", 8, 2)
+    assert isinstance(plan, WrapPlan)
+    assert [line.text for line in plan.lines] == ["一二三", "四五六"]
+    assert [line.width for line in plan.lines] == [6, 6]
+    assert plan.breaks == (3,)
+
+
+def test_wrap_tie_break_prefers_earlier_break_sequence():
+    # 原子宽度 [2,2,1,2,2]（共 9 列，a 两侧是汉字故独立成原子），7 列 2 行：
+    # 断在第 2 个原子后为 4/5（代价 3²+2²=13），断在第 3 个原子后为 5/4
+    # （代价 2²+3²=13），完全同分且均为全局最优 -> 取断点序列靠前的 (2,)。
+    # 更窄的断点（6/3）代价更大，故同分的恰是这两个断法
+    plan = plan_wrap("中中a中中", 7, 2)
+    assert isinstance(plan, WrapPlan)
+    assert [line.text for line in plan.lines] == ["中中", "a中中"]
+    assert [line.width for line in plan.lines] == [4, 5]
+    assert plan.breaks == (2,)
+
+
+def test_wrap_spaces_count_one_column_and_breakable():
+    plan = plan_wrap("hello world foo bar", 10, 3)
+    assert isinstance(plan, WrapPlan)
+    assert [line.text for line in plan.lines] == ["hello", "world", "foo bar"]
+    assert [line.width for line in plan.lines] == [5, 5, 7]
+    # 行内保留空格，空格计 1 列：4 个汉字 8 列 + 3 个空格 3 列 = 11 列
+    plan2 = plan_wrap("一 二 三 四", 11, 1)
+    assert isinstance(plan2, WrapPlan)
+    assert [line.text for line in plan2.lines] == ["一 二 三 四"]
+    assert plan2.lines[0].width == 11
+    # 10 列放不下 11 列的单行 -> 必须断成 2 行
+    plan3 = plan_wrap("一 二 三 四", 10, 2)
+    assert isinstance(plan3, WrapPlan)
+    assert len(plan3.lines) == 2
+
+
+def test_wrap_single_line_fits_when_possible():
+    plan = plan_wrap("一二三四五", 10, 1)
+    assert [line.text for line in plan.lines] == ["一二三四五"]
+    assert plan.breaks == ()
+
+
+def test_wrap_no_break_inside_english_word():
+    # 每个单词必须整体成行
+    plan = plan_wrap("internationalization test", 20, 2)
+    assert [line.text for line in plan.lines] == ["internationalization", "test"]
+    failure = plan_wrap("internationalization", 19, 2)
+    assert isinstance(failure, WrapFailure)
+    assert "不可断开的片段" in failure.reason and "20 列" in failure.reason
+
+
+def test_wrap_forbids_open_punct_at_line_end():
+    # 8 列：原子 你 好 （ 中 文 ） 世 界
+    # “好（”（宽 6）与“（中”（宽 4）后断行都会让“（”处行尾/“）”处行首，
+    # 可行断点须避开开标点行尾：断在“中”后 -> 行1=你好（中
+    plan = plan_wrap("你好（中文）世界", 8, 2)
+    assert [line.text for line in plan.lines] == ["你好（中", "文）世界"]
+    assert not any(line.text.endswith("（") for line in plan.lines)
+
+
+def test_wrap_forbids_close_punct_at_line_start():
+    # 11 个原子共 22 列、12 列 2 行：恰好对半断会让第 6 个原子“，”成为
+    # 第二行行首（闭标点），故只能把逗号留在第一行行尾（12/10）
+    plan = plan_wrap("一二三四五，六七八九十", 12, 2)
+    assert isinstance(plan, WrapPlan)
+    assert [line.text for line in plan.lines] == ["一二三四五，", "六七八九十"]
+    assert [line.width for line in plan.lines] == [12, 10]
+    assert not any(line.text.startswith("，") for line in plan.lines)
+
+
+def test_wrap_failure_when_too_many_lines_required():
+    failure = plan_wrap("一二三四五六", 4, 1)
+    assert isinstance(failure, WrapFailure)
+    assert "行数" in failure.reason
+
+
+def test_wrap_failure_when_only_kinsoku_violating_splits_exist():
+    # 12 列恰好只能 6/6 对半，而第 7 个字符是“，” -> 必出现行首闭标点
+    failure = plan_wrap("这是中文内容，还有更多字", 12, 2)
+    assert isinstance(failure, WrapFailure)
+    assert "行首不得为闭标点" in failure.reason
+
+
+def test_wrap_document_preserves_eol_bom_and_positioning():
+    src = (
+        BOM
+        + "1\r\n00:00:01,000 --> 00:00:03,000\r\n一二三四五六\r\n\r\n"
+        + "2\n00:00:04,000 --> 00:00:06,000 X1:10\n你好世界\n"
+    )
+    out, results = wrap_document(src, 8, 2)
+    # BOM 唯一；第一块原 CRLF 风格保留（新增内部换行也用 CRLF）
+    assert out.startswith(BOM)
+    assert out.startswith(BOM + "1\r\n00:00:01,000 --> 00:00:03,000\r\n")
+    assert "一二三\r\n四五六\r\n" in out
+    # 第二块 LF 与定位参数原样
+    assert "00:00:04,000 --> 00:00:06,000 X1:10\n" in out
+    assert results[0].changed and not results[1].changed
+
+
+def test_wrap_document_identity_when_nothing_changes():
+    src = BOM + BOM + "1\n00:00:01,000 --> 00:00:02,000\n一二三四五\n"
+    out, results = wrap_document(src, 20, 2)
+    assert out == src  # 多个 BOM 也逐字符保留
+    assert results[0].success and not results[0].changed
+
+
+def test_wrap_document_multiple_boms_collapse_to_one_on_change():
+    src = BOM + BOM + "1\n00:00:01,000 --> 00:00:02,000\n一二三四五六\n"
+    out, _ = wrap_document(src, 8, 2)
+    assert out == BOM + "1\n00:00:01,000 --> 00:00:02,000\n一二三\n四五六\n"
+
+
+def test_wrap_document_cr_only_file_uses_cr_for_new_breaks():
+    src = "1\r00:00:01,000 --> 00:00:02,000\r一二三四五六\r"
+    out, _ = wrap_document(src, 8, 2)
+    assert out == "1\r00:00:01,000 --> 00:00:02,000\r一二三\r四五六\r"
+
+
+def test_wrap_document_keeps_original_failure_cue_and_blank_lines():
+    src = (
+        "1\n00:00:01,000 --> 00:00:02,000\n一二三四五六\n\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nsupercalifragilistic\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\n五六七八九十\n"
+    )
+    out, results = wrap_document(src, 8, 2)
+    status = [(r.cue_order, r.success, r.changed) for r in results]
+    assert status == [(1, True, True), (2, False, False), (3, True, True)]
+    # 失败字幕原文不动
+    assert "2\n00:00:03,000 --> 00:00:04,000\nsupercalifragilistic\n" in out
+    # 多余空行保留
+    assert "一二三\n四五六\n\n\n2\n" in out
+    assert results[1].reason and "不可断开的片段" in results[1].reason
+
+
+def test_wrap_document_collapses_inner_newlines_to_spaces():
+    src = "1\n00:00:01,000 --> 00:00:03,000\n你好\n世界\n"
+    out, results = wrap_document(src, 20, 1)
+    assert out == "1\n00:00:01,000 --> 00:00:03,000\n你好 世界\n"
+    assert [line.text for line in results[0].lines] == ["你好 世界"]
+
+
+def test_wrap_page_served():
+    resp = client.get("/wrap")
+    assert resp.status_code == 200
+    assert "字幕智能断行" in resp.text
+    assert "/api/wrap" in resp.text
+
+
+WRAP_SRT = (
+    "1\r\n00:00:01,000 --> 00:00:03,000\r\n一二三四五六\r\n\r\n"
+    "2\n00:00:04,000 --> 00:00:06,000 X1:10\n你好 世界 hello\n第二行内容\n\n"
+    "3\n00:00:07,000 --> 00:00:08,000\nsupercalifragilistic\n"
+)
+
+
+def wrap_body(**overrides):
+    body = {"srt": WRAP_SRT, "max_columns": 8, "max_lines": 2}
+    body.update(overrides)
+    return body
+
+
+def test_api_wrap_success_and_failure_counts():
+    resp = client.post("/api/wrap", json=wrap_body())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["cue_count"] == 3
+    # 块1 可断 3/3；块2 空白折叠后宽 19 列、8 列至少 4 行；块3 单词 20 列超宽
+    assert data["wrapped_count"] == 1
+    assert data["failed_count"] == 2
+    assert data["changed_count"] == 1
+    cue1 = data["cues"][0]
+    assert cue1["cue_order"] == 1 and cue1["index"] == "1" and cue1["changed"]
+    assert [[l["text"], l["width"]] for l in cue1["lines"]] == [
+        ["一二三", 6], ["四五六", 6]
+    ]
+    assert [f["cue_order"] for f in data["failures"]] == [2, 3]
+    assert "最多行数" in data["failures"][0]["reason"]
+    assert "不可断开的片段" in data["failures"][1]["reason"]
+
+
+def test_api_wrap_srt_is_lossless_except_wrapped_bodies():
+    data = client.post("/api/wrap", json=wrap_body()).json()
+    out = data["wrapped_srt"]
+    assert out.startswith("1\r\n00:00:01,000 --> 00:00:03,000\r\n")
+    assert "一二三\r\n四五六\r\n" in out
+    # 失败块 2：原文（含 X1 定位参数、LF、两行正文）完全不动
+    assert (
+        "2\n00:00:04,000 --> 00:00:06,000 X1:10\n"
+        "你好 世界 hello\n第二行内容\n"
+    ) in out
+    # 失败块 3：超长单词原样
+    assert "3\n00:00:07,000 --> 00:00:08,000\nsupercalifragilistic\n" in out
+    # 块1 原本 1 行 CRLF、断行后变 2 行 CRLF（新增内部换行沿用原 CRLF）；
+    # 失败块 2、3 的 LF 风格保持不变
+    assert "一二三\r\n四五六\r\n" in out
+    assert out.count("\n") - out.count("\r\n") == WRAP_SRT.count("\n") - WRAP_SRT.count("\r\n")
+
+
+def test_api_wrap_no_change_returns_input_identically():
+    # 每条正文均为单行且放得下（含 CRLF / LF 混排）：归一化不改变任何正文，
+    # wrapped_srt 与输入逐字符一致
+    single_line_srt = (
+        "1\r\n00:00:01,000 --> 00:00:03,000\r\n一二三四五六\r\n\r\n"
+        "2\n00:00:04,000 --> 00:00:06,000 X1:10\n你好 世界 hello\n\n"
+        "3\n00:00:07,000 --> 00:00:08,000\nsupercalifragilistic\n"
+    )
+    resp = client.post(
+        "/api/wrap",
+        json={"srt": single_line_srt, "max_columns": 100, "max_lines": 1},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["wrapped_srt"] == single_line_srt
+    assert data["changed_count"] == 0
+    assert all(c["success"] for c in data["cues"])
+    assert data["failures"] == []
+
+
+def test_api_wrap_multiline_body_newlines_collapse_even_when_wide():
+    # 多行正文即使在足够宽、单行放得下时，原有换行也会折成空格（规格要求）
+    src = "1\n00:00:01,000 --> 00:00:03,000\n你好\n世界\n"
+    resp = client.post(
+        "/api/wrap", json={"srt": src, "max_columns": 100, "max_lines": 1}
+    )
+    assert resp.status_code == 200, resp.text
+    out = resp.json()["wrapped_srt"]
+    assert out == "1\n00:00:01,000 --> 00:00:03,000\n你好 世界\n"
+    assert resp.json()["changed_count"] == 1
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, 1.5, True, False, "8", None])
+def test_api_wrap_rejects_bad_max_columns(bad_value):
+    resp = client.post("/api/wrap", json=wrap_body(max_columns=bad_value))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["field"] == "max_columns"
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, 1.5, True, False, "2", None])
+def test_api_wrap_rejects_bad_max_lines(bad_value):
+    resp = client.post("/api/wrap", json=wrap_body(max_lines=bad_value))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["field"] == "max_lines"
+
+
+def test_api_wrap_requires_fields():
+    assert client.post("/api/wrap", json={"srt": WRAP_SRT}).status_code == 422
+    assert client.post(
+        "/api/wrap", json={"max_columns": 8, "max_lines": 2}
+    ).status_code == 422
+
+
+def test_api_wrap_rejects_bad_srt():
+    resp = client.post("/api/wrap", json=wrap_body(srt="garbage without timing"))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "srt"

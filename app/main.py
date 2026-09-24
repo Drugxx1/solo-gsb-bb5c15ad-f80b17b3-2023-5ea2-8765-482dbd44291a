@@ -20,7 +20,7 @@ from .placement import (
     parse_blocks,
     plan_positions,
 )
-from . import terms as terms_lib
+from . import linewrap, terms as terms_lib
 from .reading_load import find_reading_zones
 from .srt import SrtParseError, parse_document, parse_srt, rewrite_srt
 from .timecode import format_signed_timecode, format_timecode
@@ -28,16 +28,18 @@ from .timecode import format_signed_timecode, format_timecode
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(
-    title="字幕校正、位置规划、专名统一与阅读负荷工具",
+    title="字幕校正、位置规划、专名统一、阅读负荷与智能断行工具",
     description="粘贴 SRT 后可做时间漂移校正、按画面遮挡时段规划字幕上下位置、"
-    "统一专名别名，或分析重叠字幕叠加后的阅读负荷热区。",
-    version="1.3.0",
+    "统一专名别名、分析重叠字幕叠加后的阅读负荷热区，或按列数 / 行数限制智能断行。",
+    version="1.4.0",
 )
 
 _FIELD_LABELS = {
     "rate_threshold": "阅读速率阈值（字/秒）",
     "min_duration_ms": "最短持续时长（毫秒）",
     "switch_cost_ms": "相邻字幕上下换位代价（毫秒）",
+    "max_columns": "每行最大显示列数",
+    "max_lines": "每条字幕最多行数",
 }
 
 
@@ -62,7 +64,10 @@ async def validation_exception_handler(
         elif err.get("type") == "greater_than":
             message = f"{label}必须严格大于 0。"
         elif err.get("type") == "greater_than_equal":
-            message = f"{label}不能小于 0。"
+            if field in ("max_columns", "max_lines"):
+                message = f"{label}必须为正整数（不小于 1）。"
+            else:
+                message = f"{label}不能小于 0。"
         else:
             message = f"{label}不合法。"
         return JSONResponse(
@@ -213,6 +218,41 @@ class TermsResponse(BaseModel):
     hit_count: int
 
 
+class WrapRequest(BaseModel):
+    srt: str = Field(..., description="原始 SRT 内容")
+    max_columns: StrictInt = Field(
+        ..., ge=1, description="每行最大显示列数（正整数）"
+    )
+    max_lines: StrictInt = Field(
+        ..., ge=1, description="每条字幕最多行数（正整数）"
+    )
+
+
+class WrappedLineView(BaseModel):
+    text: str
+    width: int
+
+
+class WrapCueView(BaseModel):
+    cue_order: int
+    index: str
+    success: bool
+    changed: bool
+    original_text: str
+    lines: list[WrappedLineView]
+    reason: str | None = None
+
+
+class WrapResponse(BaseModel):
+    wrapped_srt: str
+    cue_count: int
+    wrapped_count: int
+    failed_count: int
+    changed_count: int
+    cues: list[WrapCueView]
+    failures: list[WrapCueView]
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -236,6 +276,11 @@ def reading_load_page() -> FileResponse:
 @app.get("/terms")
 def terms_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "terms.html")
+
+
+@app.get("/wrap")
+def wrap_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "wrap.html")
 
 
 @app.post("/api/correct", response_model=CorrectResponse)
@@ -444,4 +489,41 @@ def unify_terms(req: TermsRequest) -> TermsResponse | JSONResponse:
             for hit in hits
         ],
         hit_count=len(hits),
+    )
+
+
+@app.post("/api/wrap", response_model=WrapResponse)
+def wrap_lines(req: WrapRequest) -> WrapResponse | JSONResponse:
+    # 1. 复用同一套 SRT 解析器：结构不合法仍返回 422（detail.type 为 srt）
+    # 2. 逐条做 DP 断行；排不下的字幕保留原正文，只记录输入顺序号与原因。
+    #    只替换成功且正文确有变化的字幕正文物理行，序号、时间轴、定位参数、
+    #    块间空行、原换行风格（CRLF/LF/CR）与开头 BOM 保持原样
+    try:
+        wrapped_srt, results = linewrap.wrap_document(
+            req.srt, req.max_columns, req.max_lines
+        )
+    except SrtParseError as exc:
+        raise HTTPException(status_code=422, detail={"type": "srt", "message": str(exc)})
+
+    cue_views = [
+        WrapCueView(
+            cue_order=r.cue_order,
+            index=r.index,
+            success=r.success,
+            changed=r.changed,
+            original_text=r.original_text,
+            lines=[WrappedLineView(text=line.text, width=line.width) for line in r.lines],
+            reason=r.reason,
+        )
+        for r in results
+    ]
+
+    return WrapResponse(
+        wrapped_srt=wrapped_srt,
+        cue_count=len(cue_views),
+        wrapped_count=sum(1 for v in cue_views if v.success),
+        failed_count=sum(1 for v in cue_views if not v.success),
+        changed_count=sum(1 for v in cue_views if v.changed),
+        cues=cue_views,
+        failures=[v for v in cue_views if not v.success],
     )
